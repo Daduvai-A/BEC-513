@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+import time
+
+import numba as nb
+import numpy as np
+from numba import njit, prange
+
+
+# ------------------------------------------------------------------ input
+def _open(path: str, threads: int):
+    with open(path, "rb") as fh:
+        gz = fh.read(2) == b"\x1f\x8b"
+    if not gz:
+        return open(path, "rb", buffering=0)
+    try:
+        import rapidgzip
+
+        return rapidgzip.open(path, parallelization=max(1, threads))
+    except ImportError:
+        import gzip
+
+        return gzip.open(path, "rb")
+
+
+def blocks(fileobjs, block=128 << 20):
+    """Yield (buf, z) with buf[:z] = whole lines; bounded memory."""
+    buf = np.empty(block + (1 << 20), np.uint8)
+    for fh in fileobjs:
+        carry = 0
+        eof = False
+        while not eof:
+            o = carry
+            while o < block:
+                chunk_size = min(block - o, 32 * 1024 * 1024)
+                n = fh.readinto(memoryview(buf)[o:o + chunk_size])
+                
+                if not n:
+                    eof = True
+                    break
+                o += n
+            if eof:
+                if o and buf[o - 1] != 10:
+                    buf[o] = 10
+                    o += 1
+                z = o
+            else:
+                w = min(o, 1 << 20)
+                nl = np.flatnonzero(buf[o - w : o][::-1] == 10)
+                if nl.size == 0 and w < o:
+                    nl = np.flatnonzero(buf[:o][::-1] == 10)
+                if nl.size == 0:
+                    nb_ = np.empty(2 * buf.size, np.uint8)
+                    nb_[:o] = buf[:o]
+                    buf, block, carry = nb_, 2 * block, o
+                    continue
+                z = o - int(nl[0])
+            if z:
+                yield buf, z
+            carry = o - z
+            if carry:
+                buf[:carry] = buf[z:o].copy()
+
+
+# ------------------------------------------------------------------ kernel
+@njit(cache=True)
+def chunk_bounds(buf, z, T):
+    b = np.empty(T + 1, np.int64)
+    b[0] = 0
+    for t in range(1, T):
+        p = (z * t) // T
+        if p < b[t - 1]:
+            p = b[t - 1]
+        while p > 0 and p < z and buf[p - 1] != 10:
+            p += 1
+        b[t] = p
+    b[T] = z
+    return b
+
+
+@njit(cache=True, parallel=True, nogil=True)
+def accumulate(buf, bounds, cS, cE, cStr, cFS, cFE, W, LMAX, M, stats):
+    """M[t, length, offset + W] += 1 for every pair.  stats[t] = [used, bad, long, outside]."""
+    T = bounds.size - 1
+    for t in prange(T):
+        p = bounds[t]
+        end = bounds[t + 1]
+        while p < end:
+            f = 1
+            ss = -1
+            se = -1
+            fs = -1
+            fe = -1
+            minus = False
+            while True:
+                if f == cS or f == cE or f == cFS or f == cFE:
+                    v = 0
+                    nd = 0
+                    while buf[p] >= 48 and buf[p] <= 57:
+                        v = v * 10 + (buf[p] - 48)
+                        p += 1
+                        nd += 1
+                    if nd > 0:
+                        if f == cS:
+                            ss = v
+                        if f == cE:
+                            se = v
+                        if f == cFS:
+                            fs = v
+                        if f == cFE:
+                            fe = v
+                elif f == cStr:
+                    if buf[p] == 45:  # '-'
+                        minus = True
+                while buf[p] != 9 and buf[p] != 10:
+                    p += 1
+                if buf[p] == 10:
+                    p += 1
+                    break
+                p += 1
+                f += 1
+            if ss < 0 or se < 0 or fs < 0 or fe < 0:
+                stats[t, 1] += 1
+                continue
+            ln = fe - fs
+            if ln < 0 or ln > LMAX:
+                stats[t, 2] += 1
+                continue
+            off = (fs + fe) // 2 - (ss + se) // 2
+            if minus:
+                off = -off
+            if off < -W or off > W:
+                stats[t, 3] += 1
+                continue
+            M[t, ln, off + W] += 1
+            stats[t, 0] += 1
+
+
+# ------------------------------------------------------------------ main
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="V-plot matrix from site-fragment pairs (stdin or files).")
+    ap.add_argument("inputs", nargs="*", help="input files (default: standard input)")
+    ap.add_argument("-o", "--prefix", default="vplot")
+    ap.add_argument("-f", "--format", choices=["wide", "long", "both"], default="both")
+    ap.add_argument("-w", "--window", type=int, default=500, help="offsets -W..W (default 500)")
+    ap.add_argument("--min-len", type=int, help="first matrix row (default: smallest observed length)")
+    ap.add_argument("--max-len", type=int, help="last matrix row (default: largest observed length)")
+    ap.add_argument("--cols", default="3,4,7,9,10",
+                    help="1-based columns: site_start,site_end,site_strand(0=none),frag_start,frag_end")
+    ap.add_argument("-j", "--threads", type=int, default=os.cpu_count() or 1)
+    a = ap.parse_args(argv)
+
+    t0 = time.perf_counter()
+    nb.set_num_threads(max(1, min(a.threads, nb.config.NUMBA_NUM_THREADS)))
+    cS, cE, cStr, cFS, cFE = (int(x) for x in a.cols.split(","))
+    W = a.window
+    LMAX = a.max_len if a.max_len is not None else 1000  # longer fragments are counted as skipped
+    T = max(1, min(a.threads, nb.config.NUMBA_NUM_THREADS))
+    M = np.zeros((T, LMAX + 1, 2 * W + 1), np.int32)
+    stats = np.zeros((T, 4), np.int64)
+
+    fobjs = [_open(p, min(a.threads, 16)) for p in a.inputs] if a.inputs else [sys.stdin.buffer]
+    for buf, z in blocks(fobjs):
+        accumulate(buf, chunk_bounds(buf, z, T), cS, cE, cStr, cFS, cFE, W, LMAX, M, stats)
+    for fh in fobjs:
+        if fh is not sys.stdin.buffer:
+            fh.close()
+    mat = M.sum(0, dtype=np.int64)
+    del M
+    st = stats.sum(0)
+    t1 = time.perf_counter()
+
+    rows = np.flatnonzero(mat.sum(1))
+    lo = a.min_len if a.min_len is not None else (int(rows[0]) if rows.size else 0)
+    hi = a.max_len if a.max_len is not None else (int(rows[-1]) if rows.size else 0)
+    mat = mat[lo : hi + 1]
+    lengths = np.arange(lo, hi + 1)
+    offsets = np.arange(-W, W + 1)
+    os.makedirs(os.path.dirname(a.prefix) or ".", exist_ok=True)
+    outs = []
+    if a.format in ("wide", "both"):
+        path = f"{a.prefix}.wide.tsv"
+        with open(path, "w") as fh:
+            fh.write(str(offsets.size) + "\t" + "\t".join(map(str, offsets)) + "\n")
+            np.savetxt(fh, np.column_stack([lengths, mat]), fmt="%d", delimiter="\t")
+        outs.append(path)
+    if a.format in ("long", "both"):
+        path = f"{a.prefix}.long.tsv"
+        L, O = np.meshgrid(lengths, offsets, indexing="ij")
+        with open(path, "w") as fh:
+            np.savetxt(fh, np.column_stack([O.ravel(), L.ravel(), mat.ravel()]), fmt="%d", delimiter="\t")
+        outs.append(path)
+    t2 = time.perf_counter()
+    sys.stderr.write(
+        f"pairs used {st[0]:,} | skipped: malformed {st[1]:,}, length>{LMAX} {st[2]:,}, |offset|>{W} {st[3]:,}\n"
+        f"matrix {mat.shape[0]} lengths ({lo}-{hi}) x {offsets.size} offsets ({-W}..{W}); "
+        f"read+count {t1 - t0:.2f}s, write {t2 - t1:.2f}s\n")
+    for p in outs:
+        print(p)
+
+
+if __name__ == "__main__":
+    main()
