@@ -1,21 +1,15 @@
-# BEC-513 project-3
+# BEC-513 project-4
 
- V-plot matrix 
+"""
+tcga_boxplot.py -- Project 4: expression of a gene in Primary Tumor vs Solid Tissue Normal
+from GDC/TCGA STAR "augmented_star_gene_counts" files.
 
-Reads the site-fragment pairs from STANDARD INPUT (or from files given as arguments) and writes
-the count matrix for Gnuplot:
-
-  wide : <prefix>.wide.tsv   gnuplot "nonuniform matrix" layout
-           row 0      : <number of offsets>  -500 -499 ... 500
-           rows 1..   : <fragment length>    count@-500 count@-499 ... count@500
-         (i.e. 1st column = fragment length, following columns = counts per offset)
-  long : <prefix>.long.tsv   "offset length count" (x y z), one line per cell
-
-Input columns (1-based, defaults match the provided mapped.bed.gz):
-  site window start/end = 3/4, site strand = 7, fragment start/end = 9/10.
-offset = midpoint(fragment) - centre(site window), sign flipped for '-' strand sites so the
-plot is oriented 5'->3' along the motif.  length = fragment end - start.
-
-Usage:
-  zcat mapped.bed.gz | python vplot.py -o vplot            # standard input (as required)
-  python vplot.py -o vplot mapped.bed.gz                   # same, with parallel gzip decoding
+Input
+  --sample-sheet gdc_sample_sheet.tsv   (columns used: File ID, File Name, Sample Type [, Case ID, Sample ID])
+  either --data-dir DIR                (extracted tcga_data.tar.gz: DIR/<File ID>/<File Name>)
+  or     --tar tcga_data.tar.gz        (streamed directly, no extraction to disk)
+Output (prefix):
+  <prefix>.values.tsv   one row per file: ids, sample type, TPM, log2(TPM+1)
+  <prefix>.stats.tsv    n, median, IQR per group; Mann-Whitney U and Welch t-test p-values
+  <prefix>.png/.pdf     notched boxplot, Y = log2(TPM + 1), n per group, p-value
+"""
